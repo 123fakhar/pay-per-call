@@ -1,0 +1,136 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches:
+      - main
+      - master
+    tags:
+      - "v*"
+  pull_request:
+    branches:
+      - main
+      - master
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' && github.ref != 'refs/heads/master' }}
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  validate:
+    name: Lint, Test & Build
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: "npm"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run linting
+        run: npm run lint
+
+      - name: Check TypeScript types
+        run: npm run typecheck
+
+      - name: Run automated test suite
+        run: npm run test
+
+      - name: Build Next.js application
+        env:
+          NEXT_TELEMETRY_DISABLED: "1"
+          NODE_ENV: "production"
+        run: npm run build
+
+      - name: Verify worker bundle
+        run: npx esbuild worker/index.ts --bundle --platform=node --format=cjs --outfile=dist/worker.cjs --target=node22
+
+  build-and-push:
+    name: Build & Push Container Image
+    needs: validate
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/tags/v'))
+    runs-on: ubuntu-24.04
+    outputs:
+      image_tag: ${{ steps.meta.outputs.image_tag }}
+      image_name: ${{ steps.meta.outputs.image_name }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Determine Docker Image Tags
+        id: meta
+        run: |
+          REPO_LOWER=$(echo "${{ github.repository }}" | tr '[:upper:]' '[:lower:]')
+          IMAGE="ghcr.io/${REPO_LOWER}"
+          TAG="${{ github.sha }}"
+          echo "image_name=${IMAGE}" >> "$GITHUB_OUTPUT"
+          echo "image_tag=${IMAGE}:${TAG}" >> "$GITHUB_OUTPUT"
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ steps.meta.outputs.image_name }}:${{ github.sha }}
+            ${{ steps.meta.outputs.image_name }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  deploy:
+    name: Deploy to Production VPS
+    needs: build-and-push
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/tags/v'))
+    runs-on: ubuntu-24.04
+    concurrency: production-deployment
+    steps:
+      - name: Deploy to VPS via SSH
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          fingerprint: ${{ secrets.VPS_KNOWN_HOSTS }}
+          script_stop: true
+          envs: APP_IMAGE,APP_VERSION,GIT_SHA
+          APP_IMAGE: ${{ needs.build-and-push.outputs.image_tag }}
+          APP_VERSION: ${{ github.ref_name }}
+          GIT_SHA: ${{ github.sha }}
+          script: |
+            set -eu
+            export DEPLOY_ROOT="${DEPLOY_ROOT:-/opt/assured}"
+            cd "$DEPLOY_ROOT"
+
+            echo "==> Authenticating GHCR on VPS if credentials provided"
+            if [ -n "${GHCR_PAT:-}" ]; then
+              echo "$GHCR_PAT" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+            fi
+
+            echo "==> Executing atomic deployment script for image $APP_IMAGE"
+            export APP_IMAGE="$APP_IMAGE"
+            export APP_VERSION="$APP_VERSION"
+            export GIT_SHA="$GIT_SHA"
+
+            /bin/sh "$DEPLOY_ROOT/scripts/deploy.sh"
+
+            echo "==> Deployment successfully verified for commit $GIT_SHA"

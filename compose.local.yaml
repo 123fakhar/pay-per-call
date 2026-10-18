@@ -1,0 +1,22 @@
+# Local-only overlay: HTTP Caddy and a local env file.
+# Usage: docker compose -f compose.yaml -f compose.local.yaml up --build
+services:
+  caddy:
+    environment:
+      APP_DOMAIN: ":80"
+      TLS_EMAIL: ""
+    ports:
+      - "8080:80"
+  app:
+    env_file:
+      - .env.example
+  worker:
+    env_file:
+      - .env.example
+  postgres:
+    environment:
+      POSTGRES_USER: assured_migrator
+      POSTGRES_PASSWORD: local_migrate_change_me
+      APP_DB_USER: assured_app
+      APP_DB_PASSWORD: local_app_change_me
+      POSTGRES_DB: assured
